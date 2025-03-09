@@ -11,6 +11,11 @@ from dotenv import load_dotenv
 from langchain_community.vectorstores import PGVector # pgvector용 모듈
 import os
 import pandas as pd
+from .models import ChatSession, ChatMessage
+from langchain.schema import HumanMessage, AIMessage
+from cachetools import TTLCache
+
+
 load_dotenv()
 
 # API 키 환경변수에서 가져오기
@@ -34,46 +39,20 @@ str_outputparser = StrOutputParser()
 prompt = ChatPromptTemplate.from_messages(
     [
         MessagesPlaceholder(variable_name="chat_history"),
-        ("system", "game : {context}"),
+        # ("system", "game : {context}"),
         (
             "system",
             """당신은 게임 추천 전문가입니다. 반드시 다음 언어로 답변하시오 : korean.
-            - 아래 조건에 따라 답변하시오
+            - 아래 조건에 따라 답변하시오.
+            - 질문자가 선호하는 게임은 {game}입니다.
+            - 질문자가 선호하는 장르는 {genre}입니다.
             """,
         ),
         ("human", "{input}"),
     ]
 )
 
-# def load_csv():
-#     file_path=os.path.abspath('chatmate/data/games.csv')
-#     data = pd.read_csv(file_path, encoding="utf-8")
-#     documents = [
-#         Document(
-#             page_content=" | ".join([f"{col}: {value}" for col, value in row.items() if col != "appid"]),  # AppID 제외하고 모든 컬럼을 결합
-#             metadata={"appid": row["appid"], "genres": row["genres"]}  # 메타데이터에 AppID와 Category 포함
-#         )
-#         for _, row in data.iterrows()
-#     ]
-    
-#     return documents
-
-# def create_vectorstore(data):
-#     try:
-#         # PGVector를 사용한 벡터 스토어 생성
-#         vector_store = PGVector.from_documents(
-#             documents=data,
-#             embedding=embeddings,
-#             connection=CONNECTION_STRING,
-#             collection_name="games_collection",  # 테이블 이름 역할
-#         )
-        
-#         print("PGVector 벡터 DB를 생성하였습니다.")
-#         # 우선 모든에러처리
-#     except Exception as e: 
-#         print(f"벡터 db 초기화 중 오류 :: {e}")
-#     return vector_store
-
+# 데이터 불러오기
 def load_and_chunk_csv(chunk_size=100):
     file_path = os.path.abspath('chatmate/data/games.csv')
     data = pd.read_csv(file_path, encoding="utf-8")
@@ -92,6 +71,7 @@ def load_and_chunk_csv(chunk_size=100):
     
     return chunks
 
+# 벡터 스토어 생성
 def create_vectorstore_from_chunks(chunks):
     vector_store = None
     for chunk in chunks:
@@ -109,6 +89,7 @@ def create_vectorstore_from_chunks(chunks):
     return vector_store
 
 
+# 벡터 스토어 초기화
 def initialize_vectorstore():
     
     try: 
@@ -146,12 +127,27 @@ def docs_join_logic(docs):
 docs_join = RunnableLambda(docs_join_logic)
 
 # 체인
-rag_chain =  chat | str_outputparser | retriever | docs_join
 chain = prompt | chat | str_outputparser
 
-store = {}
+# store를 TTLCache로 변경 (maxsize=1000개, ttl=1800초(30분))
+store = TTLCache(maxsize=1000, ttl=1800)
 
-# 대화 세션에 대화를 입력해줄 함수
+# RDB에 있는 대화 내역을 메모리에 저장하는 함수
+def bring_session_history(session_id):
+    try:
+        # 세션이 없거나 만료되었으면 새로 생성
+        if session_id not in store:
+            history = ChatMessageHistory()
+            for message in ChatMessage.objects.filter(session_id=session_id).order_by('created_at')[:5]:
+                history.add_message(HumanMessage(content=message.user_message))
+                history.add_message(AIMessage(content=message.chatbot_message))
+            store[session_id] = history
+        return store[session_id]
+    except Exception as e:
+        print(f"Session {session_id} expired or error occurred: {e}")
+        return None
+
+# 세션 내역 가져오기
 def get_session_history(session_ids):
     if session_ids not in store:
         store[session_ids] = ChatMessageHistory()
@@ -165,13 +161,28 @@ chain_with_history = RunnableWithMessageHistory(
     history_messages_key="chat_history",
 )
 
-def chatbot_call(user_input, session_id):
+def chatbot_call(user_input, session_id, genre=None, game=None, appid=None):
     # RAG 체인을 통해 컨텍스트 생성
+    retriever = vector_store.as_retriever(
+        search_kwargs={
+            "k": 3,
+            "filter": {
+                "genres": {
+                    "$and": genre
+                }
+            } if genre else None,
+            "filter": {
+                "appid": {
+                    "$not": appid
+                }
+            } if appid else None
+        }
+    )
+    rag_chain =  chat | str_outputparser | retriever | docs_join
     context = rag_chain.invoke(f"Translate the following question into English: {user_input}")
     
     answer = chain_with_history.invoke(
-        {"input" : user_input, "context" : context},
+        {"input" : user_input, "context" : context, "genre" : ", ".join(genre), "game" : ", ".join(game)},
         config ={"configurable": {"session_id": session_id}}
     )
-    print(context)
     return answer
